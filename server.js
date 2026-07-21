@@ -1,24 +1,31 @@
 /**
- * Ticker — real backend, now on a real relational database (SQLite).
+ * Ticker — real backend, now on a real hosted Postgres database (Neon/Supabase/etc).
  *
- * WHAT CHANGED FROM THE JSON-FILE VERSION:
- *  - Accounts, sessions, holdings, and transactions now live in proper SQL tables
- *    instead of one big JSON blob that got rewritten on every request.
- *  - Foreign keys tie holdings/transactions/sessions to a user's row.
- *  - Uses Node's built-in `node:sqlite` module (Node 22+) — no npm install, no
- *    native compilation, no network access needed. It's marked "experimental"
- *    by Node itself (hence the warning printed on startup), but it's real SQLite
- *    under the hood, not a toy.
+ * WHAT CHANGED FROM THE SQLITE VERSION:
+ *  - Accounts, sessions, holdings, transactions now live in a real Postgres database
+ *    reached over the network via a connection string — not a local file. This solves
+ *    the problem where a local SQLite file got wiped every time a free-tier host (like
+ *    Render's free web service) spun down and back up: Postgres lives independently,
+ *    on its own host, and survives your app server restarting completely.
+ *  - Uses the `pg` package (the standard, extremely widely-used Postgres client for
+ *    Node) — this is the one dependency this project needs, added specifically to
+ *    solve the persistence problem. Everything else stays dependency-free.
+ *  - IMPORTANT HONESTY NOTE: this rewrite could not be tested against a real Postgres
+ *    database in the environment it was written in (no internet access, no local
+ *    Postgres installed). It's written using standard, well-established `pg` patterns,
+ *    but — unlike the rest of this project, which was tested directly — expect to
+ *    debug real connection/query issues together once you actually run this against
+ *    your real Neon/Supabase database.
  *
- * WHAT'S STILL THE SAME (see the previous version's notes — still true here):
+ * WHAT'S STILL THE SAME:
  *  - Real password hashing (scrypt + per-user salt, timing-safe compare)
  *  - Real session tokens, verified server-side on every request
  *  - "USD balance" is fake paper money — no real bank account involved
  *  - "Buying" a coin moves paper balances only — no real money or crypto moves
  *  - Prices are a simulated random walk, not a live market feed
  *
- * The API routes and response shapes are unchanged from the JSON-file version,
- * so the existing frontend (public/index.html) works with this file as-is.
+ * The API routes and response shapes are unchanged, so the existing frontend
+ * (public/index.html, public/mobile.html) works with this file as-is.
  */
 
 const http = require("http");
@@ -27,16 +34,31 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const url = require("url");
-const { DatabaseSync } = require("node:sqlite");
+const { Pool } = require("pg");
 
 const PORT = process.env.PORT || 3000;
-// DATA_DIR lets the database live outside the app's code folder — required when using a
-// Render persistent Disk (or similar), which mounts at a fixed path independent of where
-// your code is checked out. Falls back to a local "data" folder for local development.
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
-const DB_PATH = path.join(DATA_DIR, "ticker.db");
 const PUBLIC_DIR = path.join(__dirname, "public");
 const STARTING_PAPER_BALANCE = 10000; // fake USD credited to every new account, for demo trading only
+
+/* ---------------------------------------------------------------- */
+/* Postgres configuration                                             */
+/* ---------------------------------------------------------------- */
+/* Set DATABASE_URL to your Neon/Supabase/etc connection string, e.g.:
+     postgresql://user:password@host.neon.tech/dbname?sslmode=require
+   Most hosted Postgres providers (Neon, Supabase, Render Postgres) require SSL —
+   the ssl option below is set permissively (rejectUnauthorized: false) since these
+   providers use certificates that Node doesn't always validate cleanly by default.
+   This is a common, accepted pattern for connecting to managed Postgres providers,
+   not a security shortcut specific to this project. */
+
+if (!process.env.DATABASE_URL) {
+  console.error("DATABASE_URL is not set. Set it to your Postgres connection string (e.g. from Neon or Supabase) before starting the server.");
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes("localhost") ? false : { rejectUnauthorized: false }
+});
 
 /* ---------------------------------------------------------------- */
 /* Stripe configuration — test mode only                              */
@@ -182,115 +204,169 @@ function squareRequest(method, apiPath, bodyObj) {
 /* Database setup                                                     */
 /* ---------------------------------------------------------------- */
 
-fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-const db = new DatabaseSync(DB_PATH);
+/* ---------------------------------------------------------------- */
+/* Database schema (created automatically on startup if missing)     */
+/* ---------------------------------------------------------------- */
+/* Note on types: timestamps use BIGINT, not INTEGER — Date.now() returns
+ * millisecond timestamps that are already too large for Postgres's 4-byte
+ * INTEGER type (max ~2.1 billion; current millisecond timestamps are in the
+ * trillions). This was a real gotcha ported over from SQLite, which doesn't
+ * have this limitation, so it's called out explicitly here. */
 
-db.exec(`PRAGMA foreign_keys = ON;`);
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      balance_usd DOUBLE PRECISION NOT NULL DEFAULT ${STARTING_PAPER_BALANCE},
+      created_at BIGINT NOT NULL
+    );
+  `);
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    email TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    balance_usd REAL NOT NULL DEFAULT ${STARTING_PAPER_BALANCE},
-    created_at INTEGER NOT NULL
-  );
-`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      token TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at BIGINT NOT NULL
+    );
+  `);
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS sessions (
-    token TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL,
-    created_at INTEGER NOT NULL,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
-`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS holdings (
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      ticker TEXT NOT NULL,
+      amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+      PRIMARY KEY (user_id, ticker)
+    );
+  `);
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS holdings (
-    user_id INTEGER NOT NULL,
-    ticker TEXT NOT NULL,
-    amount REAL NOT NULL DEFAULT 0,
-    PRIMARY KEY (user_id, ticker),
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
-`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS transactions (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      type TEXT NOT NULL,
+      ticker TEXT NOT NULL,
+      usd_amount DOUBLE PRECISION NOT NULL,
+      coins_bought DOUBLE PRECISION NOT NULL,
+      price_at_purchase DOUBLE PRECISION NOT NULL,
+      timestamp BIGINT NOT NULL
+    );
+  `);
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    type TEXT NOT NULL,
-    ticker TEXT NOT NULL,
-    usd_amount REAL NOT NULL,
-    coins_bought REAL NOT NULL,
-    price_at_purchase REAL NOT NULL,
-    timestamp INTEGER NOT NULL,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
-`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS deposits (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      provider TEXT NOT NULL,
+      provider_ref TEXT NOT NULL,
+      usd_amount DOUBLE PRECISION NOT NULL,
+      created_at BIGINT NOT NULL,
+      UNIQUE(provider, provider_ref)
+    );
+  `);
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS deposits (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    provider TEXT NOT NULL,
-    provider_ref TEXT NOT NULL,
-    usd_amount REAL NOT NULL,
-    created_at INTEGER NOT NULL,
-    UNIQUE(provider, provider_ref),
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
-`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS square_pending (
+      ref TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      usd_amount DOUBLE PRECISION NOT NULL,
+      square_order_id TEXT,
+      created_at BIGINT NOT NULL
+    );
+  `);
+}
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS square_pending (
-    ref TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL,
-    usd_amount REAL NOT NULL,
-    square_order_id TEXT,
-    created_at INTEGER NOT NULL,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
-`);
+/* ---------------------------------------------------------------- */
+/* Database helpers — thin async wrappers around pool.query           */
+/* ---------------------------------------------------------------- */
+/* Postgres uses $1, $2... placeholders (not SQLite's ?), and every call
+ * here is async (a real network round-trip to the database), unlike the
+ * synchronous SQLite version. `row(result)` / `rows(result)` just pull the
+ * data out of pg's result object shape ({ rows: [...] }). */
 
-/* Prepared statements — reused across requests instead of re-parsed every time */
-const stmts = {
-  insertUser: db.prepare(`INSERT INTO users (name, email, password_hash, balance_usd, created_at) VALUES (?, ?, ?, ?, ?)`),
-  getUserByEmail: db.prepare(`SELECT * FROM users WHERE email = ?`),
-  getUserById: db.prepare(`SELECT * FROM users WHERE id = ?`),
-  updateBalance: db.prepare(`UPDATE users SET balance_usd = ? WHERE id = ?`),
+function row(result) { return result.rows[0] || null; }
+function rows(result) { return result.rows; }
 
-  insertSession: db.prepare(`INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)`),
-  getSession: db.prepare(`SELECT * FROM sessions WHERE token = ?`),
-  deleteSession: db.prepare(`DELETE FROM sessions WHERE token = ?`),
+const db = {
+  insertUser: (name, email, passwordHash, balance, createdAt) =>
+    pool.query(`INSERT INTO users (name, email, password_hash, balance_usd, created_at) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [name, email, passwordHash, balance, createdAt]).then(row),
 
-  getHoldings: db.prepare(`SELECT ticker, amount FROM holdings WHERE user_id = ?`),
-  upsertHolding: db.prepare(`
-    INSERT INTO holdings (user_id, ticker, amount) VALUES (?, ?, ?)
-    ON CONFLICT(user_id, ticker) DO UPDATE SET amount = amount + excluded.amount
-  `),
+  getUserByEmail: (email) =>
+    pool.query(`SELECT * FROM users WHERE email = $1`, [email]).then(row),
 
-  insertTransaction: db.prepare(`
-    INSERT INTO transactions (user_id, type, ticker, usd_amount, coins_bought, price_at_purchase, timestamp)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `),
-  getRecentTransactions: db.prepare(`
-    SELECT * FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT 20
-  `),
+  getUserById: (id) =>
+    pool.query(`SELECT * FROM users WHERE id = $1`, [id]).then(row),
 
-  getDepositByProviderRef: db.prepare(`SELECT * FROM deposits WHERE provider = ? AND provider_ref = ?`),
-  insertDeposit: db.prepare(`
-    INSERT INTO deposits (user_id, provider, provider_ref, usd_amount, created_at) VALUES (?, ?, ?, ?, ?)
-  `),
+  updateBalance: (newBalance, userId) =>
+    pool.query(`UPDATE users SET balance_usd = $1 WHERE id = $2`, [newBalance, userId]),
 
-  insertSquarePending: db.prepare(`
-    INSERT INTO square_pending (ref, user_id, usd_amount, square_order_id, created_at) VALUES (?, ?, ?, ?, ?)
-  `),
-  setSquareOrderId: db.prepare(`UPDATE square_pending SET square_order_id = ? WHERE ref = ?`),
-  getSquarePending: db.prepare(`SELECT * FROM square_pending WHERE ref = ?`)
+  insertSession: (token, userId, createdAt) =>
+    pool.query(`INSERT INTO sessions (token, user_id, created_at) VALUES ($1,$2,$3)`, [token, userId, createdAt]),
+
+  getSession: (token) =>
+    pool.query(`SELECT * FROM sessions WHERE token = $1`, [token]).then(row),
+
+  deleteSession: (token) =>
+    pool.query(`DELETE FROM sessions WHERE token = $1`, [token]),
+
+  getHoldings: (userId) =>
+    pool.query(`SELECT ticker, amount FROM holdings WHERE user_id = $1`, [userId]).then(rows),
+
+  upsertHolding: (userId, ticker, amount) =>
+    pool.query(
+      `INSERT INTO holdings (user_id, ticker, amount) VALUES ($1,$2,$3)
+       ON CONFLICT (user_id, ticker) DO UPDATE SET amount = holdings.amount + EXCLUDED.amount`,
+      [userId, ticker, amount]
+    ),
+
+  insertTransaction: (userId, type, ticker, usdAmount, coinsBought, price, timestamp) =>
+    pool.query(
+      `INSERT INTO transactions (user_id, type, ticker, usd_amount, coins_bought, price_at_purchase, timestamp)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [userId, type, ticker, usdAmount, coinsBought, price, timestamp]
+    ),
+
+  getRecentTransactions: (userId) =>
+    pool.query(`SELECT * FROM transactions WHERE user_id = $1 ORDER BY id DESC LIMIT 20`, [userId]).then(rows),
+
+  getDepositByProviderRef: (provider, ref) =>
+    pool.query(`SELECT * FROM deposits WHERE provider = $1 AND provider_ref = $2`, [provider, ref]).then(row),
+
+  insertDeposit: (userId, provider, ref, amount, createdAt) =>
+    pool.query(`INSERT INTO deposits (user_id, provider, provider_ref, usd_amount, created_at) VALUES ($1,$2,$3,$4,$5)`,
+      [userId, provider, ref, amount, createdAt]),
+
+  insertSquarePending: (ref, userId, amount, orderId, createdAt) =>
+    pool.query(`INSERT INTO square_pending (ref, user_id, usd_amount, square_order_id, created_at) VALUES ($1,$2,$3,$4,$5)`,
+      [ref, userId, amount, orderId, createdAt]),
+
+  setSquareOrderId: (orderId, ref) =>
+    pool.query(`UPDATE square_pending SET square_order_id = $1 WHERE ref = $2`, [orderId, ref]),
+
+  getSquarePending: (ref) =>
+    pool.query(`SELECT * FROM square_pending WHERE ref = $1`, [ref]).then(row)
 };
+
+/** Runs a few queries as a single atomic transaction using one dedicated client
+ * (required because BEGIN/COMMIT must happen on the same connection — unlike the
+ * simple query helpers above, which each borrow any available connection from the pool). */
+async function withTransaction(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await fn(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
 
 /* ---------------------------------------------------------------- */
 /* Password hashing (scrypt — a real, slow, salted KDF)               */
@@ -314,19 +390,19 @@ function verifyPassword(password, stored) {
 /* Sessions                                                            */
 /* ---------------------------------------------------------------- */
 
-function createSession(userId) {
+async function createSession(userId) {
   const token = crypto.randomBytes(32).toString("hex");
-  stmts.insertSession.run(token, userId, Date.now());
+  await db.insertSession(token, userId, Date.now());
   return token;
 }
 
-function getUserFromRequest(req) {
+async function getUserFromRequest(req) {
   const auth = req.headers["authorization"] || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
   if (!token) return null;
-  const session = stmts.getSession.get(token);
+  const session = await db.getSession(token);
   if (!session) return null;
-  const user = stmts.getUserById.get(session.user_id);
+  const user = await db.getUserById(session.user_id);
   return user ? { user, token } : null;
 }
 
@@ -410,19 +486,19 @@ function isValidEmail(email) {
   return typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
-function publicUser(user) {
-  const holdingsRows = stmts.getHoldings.all(user.id);
+async function publicUser(user) {
+  const holdingsRows = await db.getHoldings(user.id);
   const holdings = {};
   holdingsRows.forEach(row => { holdings[row.ticker] = row.amount; });
 
-  const txRows = stmts.getRecentTransactions.all(user.id);
+  const txRows = await db.getRecentTransactions(user.id);
   const transactions = txRows.map(row => ({
     type: row.type,
     ticker: row.ticker,
     usdAmount: row.usd_amount,
     coinsBought: row.coins_bought,
     priceAtPurchase: row.price_at_purchase,
-    timestamp: row.timestamp
+    timestamp: Number(row.timestamp)
   }));
 
   return {
@@ -447,13 +523,12 @@ async function handleApi(req, res, pathname) {
       return sendJson(res, 400, { error: "Enter a name, a valid email, and a password of at least 6 characters." });
     }
     const normalizedEmail = email.toLowerCase();
-    if (stmts.getUserByEmail.get(normalizedEmail)) {
+    if (await db.getUserByEmail(normalizedEmail)) {
       return sendJson(res, 409, { error: "An account with that email already exists. Try signing in instead." });
     }
-    const result = stmts.insertUser.run(name, normalizedEmail, hashPassword(password), STARTING_PAPER_BALANCE, Date.now());
-    const user = stmts.getUserById.get(Number(result.lastInsertRowid));
-    const token = createSession(user.id);
-    return sendJson(res, 201, { token, user: publicUser(user) });
+    const user = await db.insertUser(name, normalizedEmail, hashPassword(password), STARTING_PAPER_BALANCE, Date.now());
+    const token = await createSession(user.id);
+    return sendJson(res, 201, { token, user: await publicUser(user) });
   }
 
   if (pathname === "/api/login" && req.method === "POST") {
@@ -464,25 +539,25 @@ async function handleApi(req, res, pathname) {
       return sendJson(res, 400, { error: "Enter a valid email and password." });
     }
     const normalizedEmail = email.toLowerCase();
-    const user = stmts.getUserByEmail.get(normalizedEmail);
+    const user = await db.getUserByEmail(normalizedEmail);
     if (!user || !verifyPassword(password, user.password_hash)) {
       return sendJson(res, 401, { error: "Incorrect email or password." });
     }
-    const token = createSession(user.id);
-    return sendJson(res, 200, { token, user: publicUser(user) });
+    const token = await createSession(user.id);
+    return sendJson(res, 200, { token, user: await publicUser(user) });
   }
 
   if (pathname === "/api/logout" && req.method === "POST") {
     const auth = req.headers["authorization"] || "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-    if (token) stmts.deleteSession.run(token);
+    if (token) await db.deleteSession(token);
     return sendJson(res, 200, { ok: true });
   }
 
   if (pathname === "/api/me" && req.method === "GET") {
-    const auth = getUserFromRequest(req);
+    const auth = await getUserFromRequest(req);
     if (!auth) return sendJson(res, 401, { error: "Not signed in." });
-    return sendJson(res, 200, { user: publicUser(auth.user) });
+    return sendJson(res, 200, { user: await publicUser(auth.user) });
   }
 
   if (pathname === "/api/prices" && req.method === "GET") {
@@ -490,7 +565,7 @@ async function handleApi(req, res, pathname) {
   }
 
   if (pathname === "/api/buy" && req.method === "POST") {
-    const auth = getUserFromRequest(req);
+    const auth = await getUserFromRequest(req);
     if (!auth) return sendJson(res, 401, { error: "Sign in before buying." });
     const body = await readJsonBody(req).catch(() => null);
     if (!body) return sendJson(res, 400, { error: "Malformed request body." });
@@ -508,23 +583,26 @@ async function handleApi(req, res, pathname) {
     const coinsBought = amount / price;
     const newBalance = Number((user.balance_usd - amount).toFixed(2));
 
-    db.exec("BEGIN");
-    try {
-      stmts.updateBalance.run(newBalance, user.id);
-      stmts.upsertHolding.run(user.id, ticker, coinsBought);
-      stmts.insertTransaction.run(user.id, "buy", ticker, amount, coinsBought, price, Date.now());
-      db.exec("COMMIT");
-    } catch (err) {
-      db.exec("ROLLBACK");
-      throw err;
-    }
+    await withTransaction(async (client) => {
+      await client.query(`UPDATE users SET balance_usd = $1 WHERE id = $2`, [newBalance, user.id]);
+      await client.query(
+        `INSERT INTO holdings (user_id, ticker, amount) VALUES ($1,$2,$3)
+         ON CONFLICT (user_id, ticker) DO UPDATE SET amount = holdings.amount + EXCLUDED.amount`,
+        [user.id, ticker, coinsBought]
+      );
+      await client.query(
+        `INSERT INTO transactions (user_id, type, ticker, usd_amount, coins_bought, price_at_purchase, timestamp)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [user.id, "buy", ticker, amount, coinsBought, price, Date.now()]
+      );
+    });
 
-    const updatedUser = stmts.getUserById.get(user.id);
-    return sendJson(res, 200, { ok: true, user: publicUser(updatedUser) });
+    const updatedUser = await db.getUserById(user.id);
+    return sendJson(res, 200, { ok: true, user: await publicUser(updatedUser) });
   }
 
   if (pathname === "/api/deposit/create-checkout-session" && req.method === "POST") {
-    const auth = getUserFromRequest(req);
+    const auth = await getUserFromRequest(req);
     if (!auth) return sendJson(res, 401, { error: "Sign in before adding funds." });
     const body = await readJsonBody(req).catch(() => null);
     if (!body) return sendJson(res, 400, { error: "Malformed request body." });
@@ -558,20 +636,20 @@ async function handleApi(req, res, pathname) {
   }
 
   if (pathname === "/api/deposit/confirm" && req.method === "GET") {
-    const auth = getUserFromRequest(req);
+    const auth = await getUserFromRequest(req);
     if (!auth) return sendJson(res, 401, { error: "Sign in to confirm a deposit." });
     const parsedUrl = url.parse(req.url, true);
     const sessionId = parsedUrl.query.session_id;
     if (!sessionId) return sendJson(res, 400, { error: "Missing session_id." });
 
-    const existing = stmts.getDepositByProviderRef.get("stripe", sessionId);
+    const existing = await db.getDepositByProviderRef("stripe", sessionId);
     if (existing) {
       if (existing.user_id !== auth.user.id) {
         return sendJson(res, 403, { error: "This payment session doesn't belong to your account." });
       }
       // Already credited (e.g. user refreshed the success page) — don't double-credit, just return current state.
-      const user = stmts.getUserById.get(auth.user.id);
-      return sendJson(res, 200, { ok: true, alreadyProcessed: true, user: publicUser(user) });
+      const user = await db.getUserById(auth.user.id);
+      return sendJson(res, 200, { ok: true, alreadyProcessed: true, user: await publicUser(user) });
     }
 
     try {
@@ -585,25 +663,23 @@ async function handleApi(req, res, pathname) {
       const amount = session.amount_total / 100;
       const newBalance = Number((auth.user.balance_usd + amount).toFixed(2));
 
-      db.exec("BEGIN");
-      try {
-        stmts.updateBalance.run(newBalance, auth.user.id);
-        stmts.insertDeposit.run(auth.user.id, "stripe", sessionId, amount, Date.now());
-        db.exec("COMMIT");
-      } catch (err) {
-        db.exec("ROLLBACK");
-        throw err;
-      }
+      await withTransaction(async (client) => {
+        await client.query(`UPDATE users SET balance_usd = $1 WHERE id = $2`, [newBalance, auth.user.id]);
+        await client.query(
+          `INSERT INTO deposits (user_id, provider, provider_ref, usd_amount, created_at) VALUES ($1,$2,$3,$4,$5)`,
+          [auth.user.id, "stripe", sessionId, amount, Date.now()]
+        );
+      });
 
-      const updatedUser = stmts.getUserById.get(auth.user.id);
-      return sendJson(res, 200, { ok: true, amount, user: publicUser(updatedUser) });
+      const updatedUser = await db.getUserById(auth.user.id);
+      return sendJson(res, 200, { ok: true, amount, user: await publicUser(updatedUser) });
     } catch (err) {
       return sendJson(res, 502, { error: "Couldn't verify payment with Stripe: " + err.message });
     }
   }
 
   if (pathname === "/api/deposit/square/create" && req.method === "POST") {
-    const auth = getUserFromRequest(req);
+    const auth = await getUserFromRequest(req);
     if (!auth) return sendJson(res, 401, { error: "Sign in before adding funds." });
     const body = await readJsonBody(req).catch(() => null);
     if (!body) return sendJson(res, 400, { error: "Malformed request body." });
@@ -613,7 +689,7 @@ async function handleApi(req, res, pathname) {
     }
 
     const ref = crypto.randomBytes(16).toString("hex");
-    stmts.insertSquarePending.run(ref, auth.user.id, amount, null, Date.now());
+    await db.insertSquarePending(ref, auth.user.id, amount, null, Date.now());
 
     try {
       const result = await squareRequest("POST", "/v2/online-checkout/payment-links", {
@@ -632,7 +708,7 @@ async function handleApi(req, res, pathname) {
         }
       });
       const orderId = result.payment_link && result.payment_link.order_id;
-      if (orderId) stmts.setSquareOrderId.run(orderId, ref);
+      if (orderId) await db.setSquareOrderId(orderId, ref);
       return sendJson(res, 200, { url: result.payment_link.url, ref });
     } catch (err) {
       return sendJson(res, 502, { error: "Couldn't reach Square: " + err.message });
@@ -640,22 +716,22 @@ async function handleApi(req, res, pathname) {
   }
 
   if (pathname === "/api/deposit/square/confirm" && req.method === "GET") {
-    const auth = getUserFromRequest(req);
+    const auth = await getUserFromRequest(req);
     if (!auth) return sendJson(res, 401, { error: "Sign in to confirm a deposit." });
     const parsedUrl = url.parse(req.url, true);
     const ref = parsedUrl.query.ref;
     if (!ref) return sendJson(res, 400, { error: "Missing ref." });
 
-    const pending = stmts.getSquarePending.get(ref);
+    const pending = await db.getSquarePending(ref);
     if (!pending) return sendJson(res, 404, { error: "No matching payment found." });
     if (pending.user_id !== auth.user.id) {
       return sendJson(res, 403, { error: "This payment doesn't belong to your account." });
     }
 
-    const existing = stmts.getDepositByProviderRef.get("square", ref);
+    const existing = await db.getDepositByProviderRef("square", ref);
     if (existing) {
-      const user = stmts.getUserById.get(auth.user.id);
-      return sendJson(res, 200, { ok: true, alreadyProcessed: true, user: publicUser(user) });
+      const user = await db.getUserById(auth.user.id);
+      return sendJson(res, 200, { ok: true, alreadyProcessed: true, user: await publicUser(user) });
     }
 
     if (!pending.square_order_id) {
@@ -667,25 +743,23 @@ async function handleApi(req, res, pathname) {
       // tracks fulfillment, not payment status. The reliable signal is the associated Payment
       // object's own `status` field, which we find by listing recent payments for this location
       // and matching on order_id.
-      const payment = await findSquarePaymentForOrder(pending.square_order_id, pending.created_at);
+      const payment = await findSquarePaymentForOrder(pending.square_order_id, Number(pending.created_at));
       if (!payment || payment.status !== "COMPLETED") {
         return sendJson(res, 400, { error: `Payment not completed yet (status: ${payment ? payment.status : "not found"}).` });
       }
       const amount = pending.usd_amount;
       const newBalance = Number((auth.user.balance_usd + amount).toFixed(2));
 
-      db.exec("BEGIN");
-      try {
-        stmts.updateBalance.run(newBalance, auth.user.id);
-        stmts.insertDeposit.run(auth.user.id, "square", ref, amount, Date.now());
-        db.exec("COMMIT");
-      } catch (err) {
-        db.exec("ROLLBACK");
-        throw err;
-      }
+      await withTransaction(async (client) => {
+        await client.query(`UPDATE users SET balance_usd = $1 WHERE id = $2`, [newBalance, auth.user.id]);
+        await client.query(
+          `INSERT INTO deposits (user_id, provider, provider_ref, usd_amount, created_at) VALUES ($1,$2,$3,$4,$5)`,
+          [auth.user.id, "square", ref, amount, Date.now()]
+        );
+      });
 
-      const updatedUser = stmts.getUserById.get(auth.user.id);
-      return sendJson(res, 200, { ok: true, amount, user: publicUser(updatedUser) });
+      const updatedUser = await db.getUserById(auth.user.id);
+      return sendJson(res, 200, { ok: true, amount, user: await publicUser(updatedUser) });
     } catch (err) {
       return sendJson(res, 502, { error: "Couldn't verify payment with Square: " + err.message });
     }
@@ -730,7 +804,15 @@ const server = http.createServer((req, res) => {
   serveStatic(req, res, pathname);
 });
 
-server.listen(PORT, () => {
-  console.log(`Ticker server running at http://localhost:${PORT}`);
-  console.log(`Database: ${DB_PATH} (real SQLite — inspect it with any SQLite browser/CLI)`);
-});
+initDb()
+  .then(() => {
+    server.listen(PORT, () => {
+      console.log(`Ticker server running at http://localhost:${PORT}`);
+      console.log(`Database: connected via DATABASE_URL (Postgres) — tables created if they didn't already exist.`);
+    });
+  })
+  .catch(err => {
+    console.error("Failed to initialize the database. Check that DATABASE_URL is set correctly and the database is reachable.");
+    console.error(err);
+    process.exit(1);
+  });
