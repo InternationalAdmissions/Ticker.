@@ -372,11 +372,22 @@ function sendJson(res, status, data) {
 
 /** Square Orders stay "OPEN" even after payment (that field is about fulfillment, not
  * payment) — so to check whether an order was actually paid, we list recent payments for
- * the location and match on order_id, then check that Payment's own `status` field. */
-async function findSquarePaymentForOrder(orderId) {
-  const result = await squareRequest("GET", `/v2/payments?location_id=${encodeURIComponent(SQUARE_LOCATION_ID)}&limit=100`);
-  const payments = result.payments || [];
-  return payments.find(p => p.order_id === orderId);
+ * the location and match on order_id, then check that Payment's own `status` field.
+ * Filtered to a time window around when we created the order (rather than "all recent
+ * payments") so a growing sandbox history doesn't crowd out the one we're looking for,
+ * sorted newest-first, with a couple of short retries in case of brief indexing lag. */
+async function findSquarePaymentForOrder(orderId, createdAtMs){
+  const beginTime = new Date(createdAtMs - 5 * 60 * 1000).toISOString(); // 5 min before we created the order
+  const query = `location_id=${encodeURIComponent(SQUARE_LOCATION_ID)}&begin_time=${encodeURIComponent(beginTime)}&sort_order=DESC&limit=100`;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const result = await squareRequest("GET", `/v2/payments?${query}`);
+    const payments = result.payments || [];
+    const match = payments.find(p => p.order_id === orderId);
+    if (match) return match;
+    if (attempt < 2) await new Promise(r => setTimeout(r, 700)); // brief pause before retrying, in case Square hasn't indexed it yet
+  }
+  return null;
 }
 
 function readJsonBody(req) {
@@ -652,7 +663,7 @@ async function handleApi(req, res, pathname) {
       // tracks fulfillment, not payment status. The reliable signal is the associated Payment
       // object's own `status` field, which we find by listing recent payments for this location
       // and matching on order_id.
-      const payment = await findSquarePaymentForOrder(pending.square_order_id);
+      const payment = await findSquarePaymentForOrder(pending.square_order_id, pending.created_at);
       if (!payment || payment.status !== "COMPLETED") {
         return sendJson(res, 400, { error: `Payment not completed yet (status: ${payment ? payment.status : "not found"}).` });
       }
