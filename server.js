@@ -30,7 +30,11 @@ const url = require("url");
 const { DatabaseSync } = require("node:sqlite");
 
 const PORT = process.env.PORT || 3000;
-const DB_PATH = path.join(__dirname, "data", "ticker.db");
+// DATA_DIR lets the database live outside the app's code folder — required when using a
+// Render persistent Disk (or similar), which mounts at a fixed path independent of where
+// your code is checked out. Falls back to a local "data" folder for local development.
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
+const DB_PATH = path.join(DATA_DIR, "ticker.db");
 const PUBLIC_DIR = path.join(__dirname, "public");
 const STARTING_PAPER_BALANCE = 10000; // fake USD credited to every new account, for demo trading only
 
